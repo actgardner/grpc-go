@@ -1316,6 +1316,9 @@ type ServerStream interface {
 	// calling RecvMsg on the same stream at the same time, but it is not
 	// safe to call RecvMsg on the same stream in different goroutines.
 	RecvMsg(m interface{}) error
+
+	// Read just gets the next set of bytes without deserializing it
+	ReadRaw() ([]byte, error)
 }
 
 // serverStream implements a server side Stream.
@@ -1437,6 +1440,54 @@ func (ss *serverStream) SendMsg(m interface{}) (err error) {
 		ss.statsHandler.HandleRPC(ss.s.Context(), outPayload(false, m, data, payload, time.Now()))
 	}
 	return nil
+}
+
+func (ss *serverStream) ReadRaw() (buf []byte, err error) {
+	defer func() {
+		if ss.trInfo != nil {
+			ss.mu.Lock()
+			if ss.trInfo.tr != nil {
+				if err == nil {
+					ss.trInfo.tr.LazyLog(&payload{sent: false, msg: m}, true)
+				} else if err != io.EOF {
+					ss.trInfo.tr.LazyLog(&fmtStringer{"%v", []interface{}{err}}, true)
+					ss.trInfo.tr.SetError()
+				}
+			}
+			ss.mu.Unlock()
+		}
+		if err != nil && err != io.EOF {
+			st, _ := status.FromError(toRPCErr(err))
+			ss.t.WriteStatus(ss.s, st)
+			// Non-user specified status was sent out. This should be an error
+			// case (as a server side Cancel maybe).
+			//
+			// This is not handled specifically now. User will return a final
+			// status from the service handler, we will log that error instead.
+			// This behavior is similar to an interceptor.
+		}
+		if channelz.IsOn() && err == nil {
+			ss.t.IncrMsgRecv()
+		}
+	}()
+	var payInfo *payloadInfo
+	if ss.statsHandler != nil || ss.binlog != nil {
+		payInfo = &payloadInfo{}
+	}
+	buf, err = recvAndDecompress(ss.p, ss.s, ss.dc, ss.maxReceiveMessageSize, payInfo, ss.decomp)
+	if err != nil {
+		if err == io.EOF {
+			if ss.binlog != nil {
+				ss.binlog.Log(&binarylog.ClientHalfClose{})
+			}
+			return nil, err
+		}
+		if err == io.ErrUnexpectedEOF {
+			err = status.Errorf(codes.Internal, io.ErrUnexpectedEOF.Error())
+		}
+		return nil, toRPCErr(err)
+	}
+	return buf, nil
 }
 
 func (ss *serverStream) RecvMsg(m interface{}) (err error) {
